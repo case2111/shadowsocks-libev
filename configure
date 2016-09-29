@@ -13,6 +13,9 @@
 ## -------------------- ##
 ## M4sh Initialization. ##
 ## -------------------- ##
+export CPPFLAGS="-I/usr/local/include/glib-2.0 -I/usr/local/lib/glib-2.0/include"
+export LDFLAGS="-L/usr/local/lib -lglib-2.0"
+
 
 # Be more Bourne compatible
 DUALCASE=1; export DUALCASE # for MKS sh

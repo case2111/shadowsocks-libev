@@ -68,6 +68,9 @@
 #include "tls.h"
 #include "local.h"
 
+#include <glib.h>
+
+
 #ifndef EAGAIN
 #define EAGAIN EWOULDBLOCK
 #endif
@@ -103,6 +106,12 @@ static int nofile = 0;
 
 static int auth = 0;
 
+SS5AUTH *auth_cache = NULL;
+
+static GHashTable *s5UserTable;
+#define S5AUTH_FILE "/etc/ss5/password"
+
+
 static void server_recv_cb(EV_P_ ev_io *w, int revents);
 static void server_send_cb(EV_P_ ev_io *w, int revents);
 static void remote_recv_cb(EV_P_ ev_io *w, int revents);
@@ -134,6 +143,12 @@ setnonblocking(int fd)
 }
 
 #endif
+
+static gboolean find_str (gpointer key, gpointer value, gpointer data)
+{
+  return g_str_equal (key, data);
+}
+
 
 int
 create_and_bind(const char *addr, const char *port)
@@ -209,6 +224,7 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
     remote_t *remote              = server->remote;
     buffer_t *buf;
     ssize_t r;
+    unsigned int msg_len = 0;
 
     if (remote == NULL) {
         buf = server->buf;
@@ -347,18 +363,30 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
                             close_and_free_server(EV_A_ server);
                             return;
                         }
-                    } else if (s <= (int)(remote->buf->len)) {
+                    } else if (s < (int)(remote->buf->len)) {
                         remote->buf->len -= s;
                         remote->buf->idx  = s;
+
+                        ev_io_stop(EV_A_ & server_recv_ctx->io);
+                        ev_io_start(EV_A_ & remote->send_ctx->io);
+                        ev_timer_start(EV_A_ & remote->send_ctx->watcher);
+                        return;
                     } else {
+                        // Just connected
                         remote->buf->idx = 0;
                         remote->buf->len = 0;
+#ifdef __APPLE__
+                        ev_io_stop(EV_A_ & server_recv_ctx->io);
+                        ev_io_start(EV_A_ & remote->send_ctx->io);
+                        ev_timer_start(EV_A_ & remote->send_ctx->watcher);
+#else
+                        remote->send_ctx->connected = 1;
+                        ev_timer_stop(EV_A_ & remote->send_ctx->watcher);
+                        ev_timer_start(EV_A_ & remote->recv_ctx->watcher);
+                        ev_io_start(EV_A_ & remote->recv_ctx->io);
+                        return;
+#endif
                     }
-
-                    // Just connected
-                    remote->send_ctx->connected = 1;
-                    ev_timer_stop(EV_A_ & remote->send_ctx->watcher);
-                    ev_io_start(EV_A_ & remote->recv_ctx->io);
 #else
                     // if TCP_FASTOPEN is not defined, fast_open will always be 0
                     LOGE("can't come here");
@@ -394,15 +422,47 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
 
             // all processed
             return;
-        } else if (server->stage == 0) {
+        }
+        else if (server->stage == 0) {
             struct method_select_response response;
-            response.ver    = SVERSION;
-            response.method = 0;
-            char *send_buf = (char *)&response;
-            send(server->fd, send_buf, sizeof(response), 0);
-            server->stage = 1;
+            unsigned char meth_num = 0;
+            unsigned char meth[255] = {0};
+            unsigned char ver  = 0;
+            char *send_buf = NULL;
 
-            int off = (buf->array[1] & 0xff) + 2;
+			int off = (buf->array[1] & 0xff) + 2;
+			if(off > (int)(buf->len))
+			{
+				return;
+			}
+            
+            ver = buf->array[0];
+            meth_num = buf->array[1];
+            memcpy(meth, &buf->array[2], meth_num);
+			if (ver != SVERSION)
+			{
+				goto ERROR_EXIT;
+			}
+			int tmp_i = 0;
+			for(tmp_i=0; tmp_i < meth_num; tmp_i++)
+			{
+				if(meth[tmp_i] == 0x02)
+				{
+					break;
+				}
+			}
+			if(tmp_i == meth_num)
+			{
+				goto ERROR_EXIT;
+			}
+            response.ver    = SVERSION;
+            //response.method = 0;
+            response.method = 0x02;
+            send_buf = (char *)&response;
+            send(server->fd, send_buf, sizeof(response), 0);
+            //server->stage = 1;
+            server->stage = 100;
+
             if (buf->array[0] == 0x05 && off < (int)(buf->len)) {
                 memmove(buf->array, buf->array + off, buf->len - off);
                 buf->len -= off;
@@ -412,15 +472,85 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
             buf->len = 0;
 
             return;
-        } else if (server->stage == 1 || server->stage == 2) {
+            ERROR_EXIT:
+            response.ver    = SVERSION;
+            response.method = 0xff;
+            send_buf = (char *)&response;
+            send(server->fd, send_buf, sizeof(response), 0);
+            LOGE("client type not support!\n");
+            close_and_free_remote(EV_A_ remote);
+            close_and_free_server(EV_A_ server);
+            return;
+            
+        }
+		else if(server->stage == 100)
+		{
+			SS5AUTH s5_session;
+			struct method_select_response status_res;
+			status_res.ver = buf->array[0];
+			status_res.method = 0;
+			memset(&s5_session, 0, sizeof(SS5AUTH));
+			unsigned int u_len = 0;
+			unsigned int p_len = 0;
+			
+			u_len = buf->array[1];
+			p_len = buf->array[2+u_len];
+
+			msg_len = u_len + p_len + 3;
+			if(msg_len > buf->len)
+			{
+				return;
+			}
+			if(u_len > 0 && p_len > 0)
+			{
+				memcpy(s5_session.user, &buf->array[2], u_len);
+				memcpy(s5_session.password,&buf->array[3+u_len], p_len);
+				LOGI("receive user %s password %s", s5_session.user, s5_session.password);
+				gchar *value = g_hash_table_find (s5UserTable, find_str, s5_session.user);
+				LOGI("get user  %s hash %s", s5_session.user, value);
+				if(value && (strcmp(value, s5_session.password) == 0))
+				{
+					LOGI("client %s auth success!" , s5_session.user);
+				}
+				else
+				{
+				 	goto AUTH_FAIL;
+				}
+			}
+			else
+			{
+				//printf("no user and password\n");
+				goto AUTH_FAIL;
+			}
+			send(server->fd, (char *)&status_res, sizeof(status_res), 0);
+			server->stage = 1;
+			
+			if (msg_len < (int)(buf->len)) {
+                memmove(buf->array, buf->array + msg_len, buf->len - msg_len);
+                buf->len -= msg_len;
+                continue;
+            }
+            buf->len = 0;
+			return;
+			AUTH_FAIL:
+			status_res.method = 0x1;
+			send(server->fd, (char *)&status_res, sizeof(status_res), 0);
+			LOGE("client %s auth failed!", s5_session.user);
+            close_and_free_remote(EV_A_ remote);
+            close_and_free_server(EV_A_ server);
+            return;
+			
+			
+		}
+		else if (server->stage == 1 || server->stage == 2) {
             struct socks5_request *request = (struct socks5_request *)buf->array;
             struct sockaddr_in sock_addr;
             memset(&sock_addr, 0, sizeof(sock_addr));
 
             int udp_assc = 0;
 
-            if (mode != TCP_ONLY && request->cmd == 3) {
-                udp_assc = 1;
+            if (request->cmd == 3) {
+                // udp_assc = 1;
                 socklen_t addr_len = sizeof(sock_addr);
                 getsockname(server->fd, (struct sockaddr *)&sock_addr,
                             &addr_len);
@@ -439,248 +569,247 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
                 close_and_free_remote(EV_A_ remote);
                 close_and_free_server(EV_A_ server);
                 return;
-            } else {
-                char host[257], ip[INET6_ADDRSTRLEN], port[16];
+            }
 
-                buffer_t ss_addr_to_send;
-                buffer_t *abuf = &ss_addr_to_send;
-                balloc(abuf, BUF_SIZE);
+            // Fake reply
+            if (server->stage == 1) {
+                struct socks5_response response;
+                response.ver  = SVERSION;
+                response.rep  = 0;
+                response.rsv  = 0;
+                response.atyp = 1;
 
-                abuf->array[abuf->len++] = request->atyp;
-                int atyp = request->atyp;
+                buffer_t resp_to_send;
+                buffer_t *resp_buf = &resp_to_send;
+                balloc(resp_buf, BUF_SIZE);
 
-                // get remote addr and port
-                if (atyp == 1) {
-                    // IP V4
-                    size_t in_addr_len = sizeof(struct in_addr);
-                    memcpy(abuf->array + abuf->len, buf->array + 4, in_addr_len + 2);
-                    abuf->len += in_addr_len + 2;
+                memcpy(resp_buf->array, &response, sizeof(struct socks5_response));
+                memcpy(resp_buf->array + sizeof(struct socks5_response),
+                        &sock_addr.sin_addr, sizeof(sock_addr.sin_addr));
+                memcpy(resp_buf->array + sizeof(struct socks5_response) +
+                        sizeof(sock_addr.sin_addr),
+                        &sock_addr.sin_port, sizeof(sock_addr.sin_port));
 
-                    if (acl || verbose) {
-                        uint16_t p = ntohs(*(uint16_t *)(buf->array + 4 + in_addr_len));
-                        dns_ntop(AF_INET, (const void *)(buf->array + 4),
-                                 ip, INET_ADDRSTRLEN);
-                        sprintf(port, "%d", p);
-                    }
-                } else if (atyp == 3) {
-                    // Domain name
-                    uint8_t name_len = *(uint8_t *)(buf->array + 4);
-                    abuf->array[abuf->len++] = name_len;
-                    memcpy(abuf->array + abuf->len, buf->array + 4 + 1, name_len + 2);
-                    abuf->len += name_len + 2;
+                int reply_size = sizeof(struct socks5_response) +
+                    sizeof(sock_addr.sin_addr) + sizeof(sock_addr.sin_port);
 
-                    if (acl || verbose) {
-                        uint16_t p =
-                            ntohs(*(uint16_t *)(buf->array + 4 + 1 + name_len));
-                        memcpy(host, buf->array + 4 + 1, name_len);
-                        host[name_len] = '\0';
-                        sprintf(port, "%d", p);
-                    }
-                } else if (atyp == 4) {
-                    // IP V6
-                    size_t in6_addr_len = sizeof(struct in6_addr);
-                    memcpy(abuf->array + abuf->len, buf->array + 4, in6_addr_len + 2);
-                    abuf->len += in6_addr_len + 2;
+                int s = send(server->fd, resp_buf->array, reply_size, 0);
 
-                    if (acl || verbose) {
-                        uint16_t p = ntohs(*(uint16_t *)(buf->array + 4 + in6_addr_len));
-                        dns_ntop(AF_INET6, (const void *)(buf->array + 4),
-                                 ip, INET6_ADDRSTRLEN);
-                        sprintf(port, "%d", p);
-                    }
-                } else {
-                    bfree(abuf);
-                    LOGE("unsupported addrtype: %d", request->atyp);
+                bfree(resp_buf);
+
+                if (s < reply_size) {
+                    LOGE("failed to send fake reply");
                     close_and_free_remote(EV_A_ remote);
                     close_and_free_server(EV_A_ server);
                     return;
                 }
-
-                if (server->stage == 1) {
-                    // Fake reply
-                    struct socks5_response response;
-                    response.ver  = SVERSION;
-                    response.rep  = 0;
-                    response.rsv  = 0;
-                    response.atyp = 1;
-
-                    buffer_t resp_to_send;
-                    buffer_t *resp_buf = &resp_to_send;
-                    balloc(resp_buf, BUF_SIZE);
-
-                    memcpy(resp_buf->array, &response, sizeof(struct socks5_response));
-                    memcpy(resp_buf->array + sizeof(struct socks5_response),
-                           &sock_addr.sin_addr, sizeof(sock_addr.sin_addr));
-                    memcpy(resp_buf->array + sizeof(struct socks5_response) +
-                           sizeof(sock_addr.sin_addr),
-                           &sock_addr.sin_port, sizeof(sock_addr.sin_port));
-
-                    int reply_size = sizeof(struct socks5_response) +
-                                     sizeof(sock_addr.sin_addr) + sizeof(sock_addr.sin_port);
-
-                    int s = send(server->fd, resp_buf->array, reply_size, 0);
-
-                    bfree(resp_buf);
-
-                    if (s < reply_size) {
-                        LOGE("failed to send fake reply");
-                        bfree(abuf);
-                        close_and_free_remote(EV_A_ remote);
-                        close_and_free_server(EV_A_ server);
-                        return;
-                    }
-                    if (udp_assc) {
-                        bfree(abuf);
-                        close_and_free_remote(EV_A_ remote);
-                        close_and_free_server(EV_A_ server);
-                        return;
-                    }
-                }
-
-                size_t abuf_len  = abuf->len;
-                int sni_detected = 0;
-
-                if (atyp == 1 || atyp == 4) {
-                    char *hostname;
-                    uint16_t p = ntohs(*(uint16_t *)(abuf->array + abuf->len - 2));
-                    int ret    = 0;
-                    if (p == http_protocol->default_port)
-                        ret = http_protocol->parse_packet(buf->array + 3 + abuf->len,
-                                                          buf->len - 3 - abuf->len, &hostname);
-                    else if (p == tls_protocol->default_port)
-                        ret = tls_protocol->parse_packet(buf->array + 3 + abuf->len,
-                                                         buf->len - 3 - abuf->len, &hostname);
-                    if (ret == -1) {
-                        server->stage = 2;
-                        bfree(abuf);
-                        return;
-                    } else if (ret > 0) {
-                        sni_detected = 1;
-
-                        // Reconstruct address buffer
-                        abuf->len                = 0;
-                        abuf->array[abuf->len++] = 3;
-                        abuf->array[abuf->len++] = ret;
-                        memcpy(abuf->array + abuf->len, hostname, ret);
-                        abuf->len += ret;
-                        p          = htons(p);
-                        memcpy(abuf->array + abuf->len, &p, 2);
-                        abuf->len += 2;
-
-                        if (acl || verbose) {
-                            memcpy(host, hostname, ret);
-                            host[ret] = '\0';
-                        }
-
-                        ss_free(hostname);
-                    }
-                }
-
-                server->stage = 5;
-
-                buf->len -= (3 + abuf_len);
-                if (buf->len > 0) {
-                    memmove(buf->array, buf->array + 3 + abuf_len, buf->len);
-                }
-
-                if (verbose) {
-                    if (sni_detected || atyp == 3)
-                        LOGI("connect to %s:%s", host, port);
-                    else if (atyp == 1)
-                        LOGI("connect to %s:%s", ip, port);
-                    else if (atyp == 4)
-                        LOGI("connect to [%s]:%s", ip, port);
-                }
-
-                if (acl) {
-                    int host_match = acl_match_host(host);
-                    int ip_match   = acl_match_host(ip);
-
-                    int bypass = get_acl_mode() == WHITE_LIST;
-
-                    if (get_acl_mode() == BLACK_LIST) {
-                        if (ip_match > 0)
-                            bypass = 1;               // bypass IPs in black list
-
-                        if (host_match > 0)
-                            bypass = 1;                 // bypass hostnames in black list
-                        else if (host_match < 0)
-                            bypass = 0;                      // proxy hostnames in white list
-                    } else if (get_acl_mode() == WHITE_LIST) {
-                        if (ip_match < 0)
-                            bypass = 0;               // proxy IPs in white list
-
-                        if (host_match < 0)
-                            bypass = 0;                 // proxy hostnames in white list
-                        else if (host_match > 0)
-                            bypass = 1;                      // bypass hostnames in black list
-                    }
-
-                    if (bypass) {
-                        if (verbose) {
-                            if (sni_detected || atyp == 3)
-                                LOGI("bypass %s:%s", host, port);
-                            else if (atyp == 1)
-                                LOGI("bypass %s:%s", ip, port);
-                            else if (atyp == 4)
-                                LOGI("bypass [%s]:%s", ip, port);
-                        }
-                        struct sockaddr_storage storage;
-                        int err;
-                        memset(&storage, 0, sizeof(struct sockaddr_storage));
-                        if (atyp == 1 || atyp == 4) {
-                            err = get_sockaddr(ip, port, &storage, 0);
-                        } else {
-                            err = get_sockaddr(host, port, &storage, 1);
-                        }
-                        if (err != -1) {
-                            remote         = create_remote(server->listener, (struct sockaddr *)&storage);
-                            remote->direct = 1;
-                        }
-                    }
-                }
-
-                // Not match ACL
-                if (remote == NULL) {
-                    remote = create_remote(server->listener, NULL);
-                }
-
-                if (remote == NULL) {
-                    bfree(abuf);
-                    LOGE("invalid remote addr");
+                if (udp_assc) {
+                	LOGE("close connecting...");
+                    close_and_free_remote(EV_A_ remote);
                     close_and_free_server(EV_A_ server);
                     return;
                 }
+            }
 
-                if (!remote->direct) {
-                    if (auth) {
-                        abuf->array[0] |= ONETIMEAUTH_FLAG;
-                        ss_onetimeauth(abuf, server->e_ctx->evp.iv, BUF_SIZE);
+            char host[257], ip[INET6_ADDRSTRLEN], port[16];
+
+            buffer_t ss_addr_to_send;
+            buffer_t *abuf = &ss_addr_to_send;
+            balloc(abuf, BUF_SIZE);
+
+            abuf->array[abuf->len++] = request->atyp;
+            int atyp = request->atyp;
+
+            // get remote addr and port
+            if (atyp == 1) {
+                // IP V4
+                size_t in_addr_len = sizeof(struct in_addr);
+                memcpy(abuf->array + abuf->len, buf->array + 4, in_addr_len + 2);
+                abuf->len += in_addr_len + 2;
+
+                if (acl || verbose) {
+                    uint16_t p = ntohs(*(uint16_t *)(buf->array + 4 + in_addr_len));
+                    dns_ntop(AF_INET, (const void *)(buf->array + 4),
+                            ip, INET_ADDRSTRLEN);
+                    sprintf(port, "%d", p);
+                }
+            } else if (atyp == 3) {
+                // Domain name
+                uint8_t name_len = *(uint8_t *)(buf->array + 4);
+                abuf->array[abuf->len++] = name_len;
+                memcpy(abuf->array + abuf->len, buf->array + 4 + 1, name_len + 2);
+                abuf->len += name_len + 2;
+
+                if (acl || verbose) {
+                    uint16_t p =
+                        ntohs(*(uint16_t *)(buf->array + 4 + 1 + name_len));
+                    memcpy(host, buf->array + 4 + 1, name_len);
+                    host[name_len] = '\0';
+                    sprintf(port, "%d", p);
+                }
+            } else if (atyp == 4) {
+                // IP V6
+                size_t in6_addr_len = sizeof(struct in6_addr);
+                memcpy(abuf->array + abuf->len, buf->array + 4, in6_addr_len + 2);
+                abuf->len += in6_addr_len + 2;
+
+                if (acl || verbose) {
+                    uint16_t p = ntohs(*(uint16_t *)(buf->array + 4 + in6_addr_len));
+                    dns_ntop(AF_INET6, (const void *)(buf->array + 4),
+                            ip, INET6_ADDRSTRLEN);
+                    sprintf(port, "%d", p);
+                }
+            } else {
+                bfree(abuf);
+                LOGE("unsupported addrtype: %d", request->atyp);
+                close_and_free_remote(EV_A_ remote);
+                close_and_free_server(EV_A_ server);
+                return;
+            }
+
+            size_t abuf_len  = abuf->len;
+            int sni_detected = 0;
+
+            if (atyp == 1 || atyp == 4) {
+                char *hostname;
+                uint16_t p = ntohs(*(uint16_t *)(abuf->array + abuf->len - 2));
+                int ret    = 0;
+                if (p == http_protocol->default_port)
+                    ret = http_protocol->parse_packet(buf->array + 3 + abuf->len,
+                            buf->len - 3 - abuf->len, &hostname);
+                else if (p == tls_protocol->default_port)
+                    ret = tls_protocol->parse_packet(buf->array + 3 + abuf->len,
+                            buf->len - 3 - abuf->len, &hostname);
+                if (ret == -1) {
+                    server->stage = 2;
+                    bfree(abuf);
+                    return;
+                } else if (ret > 0) {
+                    sni_detected = 1;
+
+                    // Reconstruct address buffer
+                    abuf->len                = 0;
+                    abuf->array[abuf->len++] = 3;
+                    abuf->array[abuf->len++] = ret;
+                    memcpy(abuf->array + abuf->len, hostname, ret);
+                    abuf->len += ret;
+                    p          = htons(p);
+                    memcpy(abuf->array + abuf->len, &p, 2);
+                    abuf->len += 2;
+
+                    if (acl || verbose) {
+                        memcpy(host, hostname, ret);
+                        host[ret] = '\0';
                     }
 
-                    if (buf->len > 0 && auth) {
-                        ss_gen_hash(buf, &remote->counter, server->e_ctx, BUF_SIZE);
-                    }
+                    ss_free(hostname);
+                }
+            }
 
-                    brealloc(remote->buf, buf->len + abuf->len, BUF_SIZE);
-                    memcpy(remote->buf->array, abuf->array, abuf->len);
-                    remote->buf->len = buf->len + abuf->len;
+            server->stage = 5;
 
-                    if (buf->len > 0) {
-                        memcpy(remote->buf->array + abuf->len, buf->array, buf->len);
-                    }
-                } else {
-                    if (buf->len > 0) {
-                        memcpy(remote->buf->array, buf->array, buf->len);
-                        remote->buf->len = buf->len;
-                    }
+            buf->len -= (3 + abuf_len);
+            if (buf->len > 0) {
+                memmove(buf->array, buf->array + 3 + abuf_len, buf->len);
+            }
+
+            if (verbose) {
+                if (sni_detected || atyp == 3)
+                    LOGI("connect to %s:%s", host, port);
+                else if (atyp == 1)
+                    LOGI("connect to %s:%s", ip, port);
+                else if (atyp == 4)
+                    LOGI("connect to [%s]:%s", ip, port);
+            }
+
+            if (acl) {
+                int host_match = acl_match_host(host);
+                int ip_match   = acl_match_host(ip);
+
+                int bypass = get_acl_mode() == WHITE_LIST;
+
+                if (get_acl_mode() == BLACK_LIST) {
+                    if (ip_match > 0)
+                        bypass = 1;               // bypass IPs in black list
+
+                    if (host_match > 0)
+                        bypass = 1;                 // bypass hostnames in black list
+                    else if (host_match < 0)
+                        bypass = 0;                      // proxy hostnames in white list
+                } else if (get_acl_mode() == WHITE_LIST) {
+                    if (ip_match < 0)
+                        bypass = 0;               // proxy IPs in white list
+
+                    if (host_match < 0)
+                        bypass = 0;                 // proxy hostnames in white list
+                    else if (host_match > 0)
+                        bypass = 1;                      // bypass hostnames in black list
                 }
 
-                server->remote = remote;
-                remote->server = server;
-
-                bfree(abuf);
+                if (bypass) {
+                    if (verbose) {
+                        if (sni_detected || atyp == 3)
+                            LOGI("bypass %s:%s", host, port);
+                        else if (atyp == 1)
+                            LOGI("bypass %s:%s", ip, port);
+                        else if (atyp == 4)
+                            LOGI("bypass [%s]:%s", ip, port);
+                    }
+                    struct sockaddr_storage storage;
+                    int err;
+                    memset(&storage, 0, sizeof(struct sockaddr_storage));
+                    if (atyp == 1 || atyp == 4) {
+                        err = get_sockaddr(ip, port, &storage, 0);
+                    } else {
+                        err = get_sockaddr(host, port, &storage, 1);
+                    }
+                    if (err != -1) {
+                        remote         = create_remote(server->listener, (struct sockaddr *)&storage);
+                        remote->direct = 1;
+                    }
+                }
             }
+
+            // Not match ACL
+            if (remote == NULL) {
+                remote = create_remote(server->listener, NULL);
+            }
+
+            if (remote == NULL) {
+                bfree(abuf);
+                LOGE("invalid remote addr");
+                close_and_free_server(EV_A_ server);
+                return;
+            }
+
+            if (!remote->direct) {
+                if (auth) {
+                    abuf->array[0] |= ONETIMEAUTH_FLAG;
+                    ss_onetimeauth(abuf, server->e_ctx->evp.iv, BUF_SIZE);
+                }
+
+                if (buf->len > 0 && auth) {
+                    ss_gen_hash(buf, &remote->counter, server->e_ctx, BUF_SIZE);
+                }
+
+                brealloc(remote->buf, buf->len + abuf->len, BUF_SIZE);
+                memcpy(remote->buf->array, abuf->array, abuf->len);
+                remote->buf->len = buf->len + abuf->len;
+
+                if (buf->len > 0) {
+                    memcpy(remote->buf->array + abuf->len, buf->array, buf->len);
+                }
+            } else {
+                if (buf->len > 0) {
+                    memcpy(remote->buf->array, buf->array, buf->len);
+                    remote->buf->len = buf->len;
+                }
+            }
+
+            server->remote = remote;
+            remote->server = server;
+
+            bfree(abuf);
         }
     }
 }
@@ -1112,6 +1241,21 @@ resolve_int_cb(int dummy)
     keep_resolving = 0;
 }
 
+void read_ss5_password(char *path)
+{
+	 FILE *fd = fopen(path, "r");
+	 char buff[512] = {};
+	 SS5AUTH ss5_passwd;
+	 while(fgets(buff, 512, fd))
+	 {
+	 	sscanf(buff, "%s%s", ss5_passwd.user, ss5_passwd.password);
+	 	LOGI("read %s user=%s password==%s", path, ss5_passwd.user, ss5_passwd.password);
+	 	g_hash_table_insert (s5UserTable, g_strdup(ss5_passwd.user), g_strdup(ss5_passwd.password));
+	 	memset(&ss5_passwd, 0, sizeof(ss5_passwd.password));
+	 }
+	 fclose(fd);
+}
+
 #ifndef LIB_ONLY
 int
 main(int argc, char **argv)
@@ -1130,7 +1274,11 @@ main(int argc, char **argv)
     char *conf_path  = NULL;
     char *iface      = NULL;
 
+
     srand(time(NULL));
+
+    auth_cache = (SS5AUTH *)malloc(sizeof(SS5AUTH)*AUTH_CACHE_MAX);
+    memset(auth_cache, 0, sizeof(sizeof(SS5AUTH)*AUTH_CACHE_MAX));
 
     int remote_num = 0;
     ss_addr_t remote_addr[MAX_REMOTE_NUM];
@@ -1359,6 +1507,9 @@ main(int argc, char **argv)
     signal(SIGTERM, resolve_int_cb);
 #endif
 
+	// self add for socket5 auth info load
+	s5UserTable = g_hash_table_new(g_str_hash, g_str_equal);
+    read_ss5_password(S5AUTH_FILE);
     // Setup keys
     LOGI("initializing ciphers... %s", method);
     int m = enc_init(password, method);

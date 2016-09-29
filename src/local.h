@@ -83,4 +83,12 @@ typedef struct remote {
     uint32_t counter;
 } remote_t;
 
+typedef struct _ss5_auth_
+{
+	char user[256];
+	char password[256];
+}SS5AUTH;
+
+#define AUTH_CACHE_MAX 1024*512
+
 #endif // _LOCAL_H
