@@ -15,7 +15,7 @@ override_dh_auto_install:
 
 override_dh_auto_configure:
 	dh_auto_configure -- \
-        --enable-shared \
+	--enable-shared \
         --disable-ssp
 
 override_dh_installchangelogs:

@@ -89,6 +89,12 @@ typedef struct _ss5_auth_
 	char password[256];
 }SS5AUTH;
 
+void signal_handle_for_auth(int number);
+
+void string_free_func(void * data);
+
+
+
 #define AUTH_CACHE_MAX 1024*512
 
 #endif // _LOCAL_H

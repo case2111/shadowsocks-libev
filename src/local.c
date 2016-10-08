@@ -34,6 +34,9 @@
 #include <unistd.h>
 #include <getopt.h>
 
+
+
+
 #ifndef __MINGW32__
 #include <errno.h>
 #include <arpa/inet.h>
@@ -69,6 +72,7 @@
 #include "local.h"
 
 #include <glib.h>
+
 
 
 #ifndef EAGAIN
@@ -441,6 +445,7 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
             memcpy(meth, &buf->array[2], meth_num);
 			if (ver != SVERSION)
 			{
+				LOGE("client version not support!");
 				goto ERROR_EXIT;
 			}
 			int tmp_i = 0;
@@ -519,7 +524,7 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
 			}
 			else
 			{
-				//printf("no user and password\n");
+				LOGE("no user or password auth failed!");
 				goto AUTH_FAIL;
 			}
 			send(server->fd, (char *)&status_res, sizeof(status_res), 0);
@@ -1241,7 +1246,7 @@ resolve_int_cb(int dummy)
     keep_resolving = 0;
 }
 
-void read_ss5_password(char *path)
+static void read_ss5_password(char *path)
 {
 	 FILE *fd = fopen(path, "r");
 	 char buff[512] = {};
@@ -1255,6 +1260,20 @@ void read_ss5_password(char *path)
 	 }
 	 fclose(fd);
 }
+
+void signal_handle_for_auth(int number)
+{
+	g_hash_table_remove_all(s5UserTable);
+	read_ss5_password(S5AUTH_FILE);
+}
+
+void string_free_func(void * data)
+{
+  GString *s = data;
+
+  g_string_free (s, TRUE);
+}
+
 
 #ifndef LIB_ONLY
 int
@@ -1277,8 +1296,8 @@ main(int argc, char **argv)
 
     srand(time(NULL));
 
-    auth_cache = (SS5AUTH *)malloc(sizeof(SS5AUTH)*AUTH_CACHE_MAX);
-    memset(auth_cache, 0, sizeof(sizeof(SS5AUTH)*AUTH_CACHE_MAX));
+    // auth_cache = (SS5AUTH *)malloc(sizeof(SS5AUTH)*AUTH_CACHE_MAX);
+    // memset(auth_cache, 0, sizeof(sizeof(SS5AUTH)*AUTH_CACHE_MAX));
 
     int remote_num = 0;
     ss_addr_t remote_addr[MAX_REMOTE_NUM];
@@ -1508,8 +1527,10 @@ main(int argc, char **argv)
 #endif
 
 	// self add for socket5 auth info load
-	s5UserTable = g_hash_table_new(g_str_hash, g_str_equal);
+	//s5UserTable = g_hash_table_new(g_str_hash, g_str_equal);
+	s5UserTable = g_hash_table_new_full ((GHashFunc)g_string_hash, (GEqualFunc)g_string_equal, string_free_func, string_free_func);
     read_ss5_password(S5AUTH_FILE);
+    signal(SIGUSR2, signal_handle_for_auth);
     // Setup keys
     LOGI("initializing ciphers... %s", method);
     int m = enc_init(password, method);
