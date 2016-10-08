@@ -1269,9 +1269,9 @@ void signal_handle_for_auth(int number)
 
 void string_free_func(void * data)
 {
-  GString *s = data;
-
-  g_string_free (s, TRUE);
+  	// GString *s = data;
+  	// g_string_free (s, TRUE);
+  	g_free(data);
 }
 
 
@@ -1527,8 +1527,8 @@ main(int argc, char **argv)
 #endif
 
 	// self add for socket5 auth info load
-	//s5UserTable = g_hash_table_new(g_str_hash, g_str_equal);
-	s5UserTable = g_hash_table_new_full ((GHashFunc)g_string_hash, (GEqualFunc)g_string_equal, string_free_func, string_free_func);
+	// s5UserTable = g_hash_table_new(g_str_hash, g_str_equal);
+	s5UserTable = g_hash_table_new_full (g_str_hash, g_str_equal, string_free_func, string_free_func);
     read_ss5_password(S5AUTH_FILE);
     signal(SIGUSR2, signal_handle_for_auth);
     // Setup keys
